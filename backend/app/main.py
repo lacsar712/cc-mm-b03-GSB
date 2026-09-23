@@ -6,7 +6,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, String, create_engine, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.rules import classify
@@ -25,7 +25,11 @@ USERS = {
     "viewer": {"role": "reader", "password_hash": pwd.hash("view123456")},
 }
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
+)
 SessionLocal = sessionmaker(bind=engine)
 
 
@@ -44,6 +48,23 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class WatchSite(Base):
+    __tablename__ = "watch_sites"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site: Mapped[str] = mapped_column(String(80), unique=True)
+    created_by: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class WatchEvent(Base):
+    __tablename__ = "watch_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site: Mapped[str] = mapped_column(String(80))
+    action: Mapped[str] = mapped_column(String(10))  # add / remove
+    operator: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +73,10 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class WatchIn(BaseModel):
+    site: str = Field(min_length=1, max_length=80)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -179,3 +204,103 @@ async def alerts(ws: WebSocket):
             await ws.receive_text()
     except WebSocketDisconnect:
         sockets.discard(ws)
+
+
+def iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+@app.get("/api/watchlist")
+def get_watchlist(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        pinned = db.query(WatchSite).order_by(WatchSite.id).all()
+        names = [w.site for w in pinned]
+        latest_by_site: dict[str, Reading] = {}
+        if names:
+            latest_sub = (
+                db.query(Reading.site, func.max(Reading.id).label("max_id"))
+                .filter(Reading.site.in_(names))
+                .group_by(Reading.site)
+                .subquery()
+            )
+            for r in db.query(Reading).join(latest_sub, Reading.id == latest_sub.c.max_id).all():
+                latest_by_site[r.site] = r
+        sites = []
+        for w in pinned:
+            r = latest_by_site.get(w.site)
+            sites.append(
+                {
+                    "site": w.site,
+                    "ch4_pct": r.ch4_pct if r else None,
+                    "level": r.level if r else "无数据",
+                    "note": r.note if r else "",
+                    "latest_at": iso_utc(r.created_at) if r else None,
+                    "pinned_by": w.created_by,
+                    "pinned_at": iso_utc(w.created_at),
+                }
+            )
+        return {"sites": sites}
+    finally:
+        db.close()
+
+
+@app.post("/api/watchlist", status_code=201)
+def add_watch(body: WatchIn, user: dict = Depends(require_writer)):
+    site = body.site.strip()
+    db = SessionLocal()
+    try:
+        existing = db.query(WatchSite).filter(WatchSite.site == site).one_or_none()
+        if existing is not None:
+            raise HTTPException(status_code=409, detail="该测点已在关注名单")
+        now = datetime.now(timezone.utc)
+        db.add(WatchSite(site=site, created_by=user["username"], created_at=now))
+        db.add(WatchEvent(site=site, action="add", operator=user["username"], created_at=now))
+        db.commit()
+        return {"site": site, "action": "add"}
+    finally:
+        db.close()
+
+
+@app.delete("/api/watchlist/{site}")
+def remove_watch(site: str, user: dict = Depends(require_writer)):
+    site = site.strip()
+    db = SessionLocal()
+    try:
+        existing = db.query(WatchSite).filter(WatchSite.site == site).one_or_none()
+        if existing is None:
+            raise HTTPException(status_code=404, detail="该测点不在关注名单")
+        db.delete(existing)
+        db.add(
+            WatchEvent(
+                site=site,
+                action="remove",
+                operator=user["username"],
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+        return {"site": site, "action": "remove"}
+    finally:
+        db.close()
+
+
+@app.get("/api/watchlist/history")
+def watch_history(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        rows = db.query(WatchEvent).order_by(WatchEvent.id.desc()).all()
+        return [
+            {
+                "id": e.id,
+                "site": e.site,
+                "action": e.action,
+                "operator": e.operator,
+                "created_at": iso_utc(e.created_at),
+            }
+            for e in rows
+        ]
+    finally:
+        db.close()

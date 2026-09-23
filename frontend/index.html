@@ -12,12 +12,31 @@
     #live { min-height: 1.4em; }
     table { width: 100%; border-collapse: collapse; }
     td, th { border-bottom: 1px solid #57534e; padding: 6px; text-align: left; }
+    #watchEntry { margin-left: auto; }
+    #watchPanel { position: fixed; top: 0; right: 0; height: 100%; width: 380px; max-width: 92vw;
+      background: #292524; border-left: 1px solid #57534e; padding: 16px; overflow-y: auto;
+      transform: translateX(100%); transition: transform .2s ease; z-index: 10; box-sizing: border-box; }
+    #watchPanel.open { transform: translateX(0); }
+    #watchPanel h2 { margin-top: 4px; font-size: 18px; }
+    #watchPanel .panelHead { display: flex; align-items: center; gap: 8px; }
+    #watchPanel .panelHead button { margin-left: auto; }
+    .watchRow { border: 1px solid #57534e; border-radius: 6px; padding: 10px; margin: 8px 0; }
+    .watchRow .site { font-weight: bold; }
+    .watchRow .val { font-size: 18px; margin: 4px 0; }
+    .watchRow time { display: block; color: #a8a29e; font-size: 12px; }
+    #watchAdd { display: flex; gap: 6px; margin: 10px 0; }
+    #watchAdd input { flex: 1; margin-right: 0; }
+    .muted { color: #a8a29e; }
+    #watchHistory { font-size: 13px; }
+    #watchHistory li { margin: 3px 0; list-style: none; }
+    #watchHistory ul { padding: 0; margin: 8px 0 0; }
   </style>
 </head>
 <body>
   <header>
     <strong>矿井瓦斯班测台</strong>
     <span id="who"></span>
+    <button id="watchEntry" hidden>关注条</button>
     <button id="out" hidden>退出</button>
   </header>
   <main>
@@ -38,6 +57,19 @@
       <table><thead><tr><th>测点</th><th>甲烷 %</th><th>状态</th><th>说明</th></tr></thead><tbody id="rows"></tbody></table>
     </section>
   </main>
+  <aside id="watchPanel" hidden>
+    <div class="panelHead">
+      <h2>关注条</h2>
+      <button id="watchClose">关闭</button>
+    </div>
+    <form id="watchAdd" hidden>
+      <input id="watchSite" placeholder="钉住测点，如 回风巷" />
+      <button type="submit">钉上</button>
+    </form>
+    <div id="watchSites"></div>
+    <h3>名单变更履历</h3>
+    <div id="watchHistory"></div>
+  </aside>
   <script src="/app.js"></script>
 </body>
 </html>
