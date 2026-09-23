@@ -6,7 +6,7 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
-from sqlalchemy import DateTime, Float, String, create_engine
+from sqlalchemy import DateTime, Float, String, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.rules import classify
@@ -44,6 +44,21 @@ class Reading(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class Watch(Base):
+    __tablename__ = "watches"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site: Mapped[str] = mapped_column(String(80), unique=True)
+
+
+class WatchEvent(Base):
+    __tablename__ = "watch_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    site: Mapped[str] = mapped_column(String(80), index=True)
+    action: Mapped[str] = mapped_column(String(10))
+    username: Mapped[str] = mapped_column(String(64))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class LoginIn(BaseModel):
     username: str
     password: str
@@ -52,6 +67,10 @@ class LoginIn(BaseModel):
 class ReadingIn(BaseModel):
     site: str = Field(min_length=1, max_length=80)
     ch4_pct: float
+
+
+class WatchIn(BaseModel):
+    site: str = Field(min_length=1, max_length=80)
 
 
 def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(security)) -> dict:
@@ -168,6 +187,97 @@ async def create_reading(body: ReadingIn, user: dict = Depends(require_writer)):
     for ws in dead:
         sockets.discard(ws)
     return payload
+
+
+@app.get("/api/watchlist")
+def get_watchlist(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        watches = db.query(Watch).order_by(Watch.id).all()
+        sites = [w.site for w in watches]
+        latest: dict[str, Reading] = {}
+        if sites:
+            latest_ids = (
+                select(func.max(Reading.id))
+                .where(Reading.site.in_(sites))
+                .group_by(Reading.site)
+            )
+            for r in db.query(Reading).filter(Reading.id.in_(latest_ids)).all():
+                latest[r.site] = r
+        return {
+            "items": [
+                {
+                    "site": site,
+                    "ch4_pct": latest[site].ch4_pct if site in latest else None,
+                    "level": latest[site].level if site in latest else None,
+                    "note": latest[site].note if site in latest else None,
+                    "updated_at": latest[site].created_at if site in latest else None,
+                }
+                for site in sites
+            ]
+        }
+    finally:
+        db.close()
+
+
+@app.post("/api/watchlist", status_code=201)
+def add_watch(body: WatchIn, user: dict = Depends(require_writer)):
+    site = body.site.strip()
+    db = SessionLocal()
+    try:
+        if db.query(Watch).filter(Watch.site == site).first() is not None:
+            raise HTTPException(status_code=409, detail="该测点已在关注名单")
+        now = datetime.now(timezone.utc)
+        db.add(Watch(site=site))
+        db.add(
+            WatchEvent(site=site, action="钉上", username=user["username"], created_at=now)
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"site": site, "action": "钉上"}
+
+
+@app.delete("/api/watchlist")
+def remove_watch(site: str, user: dict = Depends(require_writer)):
+    site = site.strip()
+    db = SessionLocal()
+    try:
+        watch = db.query(Watch).filter(Watch.site == site).first()
+        if watch is None:
+            raise HTTPException(status_code=404, detail="该测点不在关注名单")
+        db.delete(watch)
+        db.add(
+            WatchEvent(
+                site=site,
+                action="取下",
+                username=user["username"],
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+    return {"site": site, "action": "取下"}
+
+
+@app.get("/api/watchlist/history")
+def watch_history(_user: dict = Depends(current_user)):
+    db = SessionLocal()
+    try:
+        rows = db.query(WatchEvent).order_by(WatchEvent.id.desc()).all()
+        return [
+            {
+                "id": r.id,
+                "site": r.site,
+                "action": r.action,
+                "username": r.username,
+                "created_at": r.created_at,
+            }
+            for r in rows
+        ]
+    finally:
+        db.close()
 
 
 @app.websocket("/ws/alerts")
